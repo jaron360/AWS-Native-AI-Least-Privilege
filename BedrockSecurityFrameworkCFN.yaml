@@ -1,0 +1,416 @@
+"AWSTemplateFormatVersion" : "2010-09-09"
+Description: |
+  Bedrock Security Framework: Deploys a VPC Interface Endpoint (PrivateLink) 
+  with a mandatory policy and IAM Roles for governed, isolated Bedrock usage.
+
+# -----------------------------------------------------------------------------
+# 1. PARAMETERS
+# -----------------------------------------------------------------------------
+Parameters:
+  VpcId:
+    Type: String
+    Description: The ID of the existing VPC where the endpoint will be created.
+  PrivateSubnetIds:
+    Type: List<String>
+    Description: List of private subnet IDs for the VPC Endpoint.
+  EndpointSecurityGroupId:
+    Type: String
+    Description: The Security Group ID to attach to the VPC Endpoint (must allow inbound traffic from your application source).
+  ExecutionGuardrailName:
+    Type: String
+    Default: BedrockExecutionGuardrail
+    Description: Name for the Bedrock Execution Guardrail for model invocations.
+    
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "VPC Configuration" }
+        Parameters: [VpcId, PrivateSubnetIds, EndpointSecurityGroupId]
+      - Label: { default: "Guardrail Configuration" }
+        Parameters: [ExecutionGuardrailName]
+
+# -----------------------------------------------------------------------------
+# 2. RESOURCES
+# -----------------------------------------------------------------------------
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # 2.1. BEDROCK EXECUTION GUARDRAIL
+  # ---------------------------------------------------------------------------
+  BedrockExecutionGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Ref ExecutionGuardrailName
+      Description: Guardrail for Bedrock model invocations with content filtering and prompt attack protection.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: INSULTS
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: SEXUAL
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: VIOLENCE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: MISCONDUCT
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+      BlockedInputMessaging: "Sorry, this request cannot be processed due to content policy violations."
+      BlockedOutputsMessaging: "Sorry, this response cannot be provided due to content policy violations."
+
+  # ---------------------------------------------------------------------------
+  # 2.2. Bedrock development role (for creating and modifying AI models)
+  # ---------------------------------------------------------------------------
+  DevelopmentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockDevelopmentRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudShellFullAccess
+      Policies:
+        - PolicyName: BedrockModelDevelopment
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowBedrockModelCreationAndModification
+                Effect: Allow
+                Action:
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:CreateModelCustomizationJob
+                  - bedrock:GetModelCustomizationJob
+                  - bedrock:ListModelCustomizationJobs
+                  - bedrock:StopModelCustomizationJob
+                  - bedrock:GetCustomModel
+                  - bedrock:ListCustomModels
+                  - bedrock:DeleteCustomModel
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                  - bedrock:ApplyGuardrail
+                  - bedrock:CreateAgent
+                  - bedrock:UpdateAgent
+                Resource:
+                  - "*"
+
+              - Sid: AllowReadOnlyOperations
+                Effect: Allow
+                Action:
+                  - bedrock:List*
+                  - bedrock:Get*
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      
+              - Sid: S3Permissions
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:ListBuckets
+                  - s3:ListObjects
+                  - s3:PutEncryptionConfiguration
+                  - s3:ListAllMyBuckets 
+                  - s3:GetBucketLocation
+                Resource: "*"
+
+              - Sid: PutObjectWithEncryptionOnly
+                Effect: Deny
+                Action: s3:PutObject
+                Resource: "*"
+                Condition:
+                  StringNotEquals:
+                    s3:x-amz-server-side-encryption: aws:kms
+
+  # ---------------------------------------------------------------------------
+  # 2.2. BEDROCK EXECUTION ROLE (For Model Execution and Testing)
+  # ---------------------------------------------------------------------------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudShellFullAccess
+      Policies:
+        - PolicyName: BedrockTestingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InferenceAndTestingAmazonModelsOnly
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:InvokeAgent
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.titan-*'
+                  - 'arn:aws:bedrock:*::foundation-model/amazon.nova-*'
+                  - 'arn:aws:bedrock:*:*:inference-profile/us.amazon.titan-*'
+                  - 'arn:aws:bedrock:*:*:inference-profile/us.amazon.nova-*'
+                #Model or agent invocation is not possible unless guardrail is used
+                Condition:
+                  StringLike:
+                    bedrock:GuardrailIdentifier: "*"
+              - Sid: AllowAgentInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail                  
+                Resource: '*'
+              - Sid: ReadOnlyAccess
+                Effect: Allow
+                Action:
+                  - bedrock:List*
+                  - bedrock:Get*
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+              - Sid: AllowViewBedrockInvocationLogs
+                #Allow execution role to view model invocation logs for testing or analysis
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:StartQuery
+                  - logs:StopQuery
+                  - logs:GetQueryResults
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock/model-invocation-logging*'
+
+
+  # ---------------------------------------------------------------------------
+  # 2.3. VPC Interface Endpoint with Policy
+  # ---------------------------------------------------------------------------
+  BedrockVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock'
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroupId
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDevelopmentAndExecutionRoleAccess
+            Effect: Allow
+            Principal: "*"
+            Action: 'bedrock:*'
+            Resource: "*"
+            #Only allow bedrock operations if source is either the development or execution IAM role
+            Condition:
+              ArnEquals:
+                'aws:PrincipalArn': 
+                  - !GetAtt DevelopmentRole.Arn
+                  - !GetAtt ExecutionRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # 2.4. BEDROCK SERVICE ROLE
+  # ---------------------------------------------------------------------------
+  BedrockS3ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Bedrock-S3ServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: BedrockS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow S3 bucket operations for model customization and batch inference
+              - Sid: AllowS3BucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                Resource:
+                  - 'arn:aws:s3:::bedrock-*'
+                  - 'arn:aws:s3:::bedrock-*/*'
+
+              # Allow KMS operations for S3 encryption/decryption
+              - Sid: AllowKMSForS3Encryption
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    'kms:ViaService': !Sub 's3.*.amazonaws.com'
+
+  # ---------------------------------------------------------------------------
+  # 2.6. BEDROCK INVOCATION CLOUDWATCH LOGGING (Encrypted Log Storage)
+  # ---------------------------------------------------------------------------
+  # KMS Key for Log Encryption
+  BedrockLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting Bedrock invocation logs
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock/*'
+
+  BedrockLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/bedrock-logs-encryption
+      TargetKeyId: !Ref BedrockLogsKMSKey
+
+  # CloudWatch Log Group for Bedrock Model Invocation Logging
+  BedrockInvocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/bedrock/model-invocation-logging
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt BedrockLogsKMSKey.Arn
+
+  # Bedrock Model Invocation Logging must be configured manually via AWS CLI or Console
+  # The log group and service role below are ready for use when configuring logging
+
+  # Service Role for Bedrock Logging
+  BedrockLoggingServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Bedrock-LoggingServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: BedrockLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt BedrockInvocationLogGroup.Arn
+              - Sid: AllowKMSForLogging
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt BedrockLogsKMSKey.Arn
+
+  # ---------------------------------------------------------------------------
+  # 2.6. IAM ACCESS ANALYZER (For Internal Access Monitoring)
+  # ---------------------------------------------------------------------------
+  BedrockIAMAccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: BedrockSecurityFrameworkAnalyzer
+      Type: ACCOUNT
+      Tags:
+        - Key: Purpose
+          Value: BedrockSecurityFramework
+        - Key: Component
+          Value: IAMAccessAnalyzer
+        - Key: Environment
+          Value: Production
+        - Key: AnalysisType
+          Value: InternalAccessMonitoring
+
+# -----------------------------------------------------------------------------
+# 3. OUTPUTS
+# -----------------------------------------------------------------------------
+Outputs:
+  BedrockVpcEndpointId:
+    Description: VPC Endpoint ID for Bedrock access.
+    Value: !Ref BedrockVpcEndpoint
+  DevelopmentRoleArn:
+    Description: ARN of the Development IAM Role for model development and customization.
+    Value: !GetAtt DevelopmentRole.Arn
+  ExecutionRoleArn:
+    Description: ARN of the Execution Role for model execution and testing.
+    Value: !GetAtt ExecutionRole.Arn
+  BedrockExecutionGuardrailId:
+    Description: ID of the Bedrock Execution Guardrail (required for model invocations).
+    Value: !GetAtt BedrockExecutionGuardrail.GuardrailId
+  BedrockExecutionGuardrailArn:
+    Description: ARN of the Bedrock Execution Guardrail.
+    Value: !GetAtt BedrockExecutionGuardrail.GuardrailArn
+  IAMAccessAnalyzerArn:
+    Description: ARN of the IAM Access Analyzer for internal access monitoring.
+    Value: !GetAtt BedrockIAMAccessAnalyzer.Arn
+  BedrockS3ServiceRoleArn:
+    Description: ARN of the Bedrock service role for S3 access (used for model customization and batch inference).
+    Value: !GetAtt BedrockS3ServiceRole.Arn
+  BedrockLogsKMSKeyId:
+    Description: KMS Key ID for Bedrock logs encryption.
+    Value: !Ref BedrockLogsKMSKey
+  BedrockInvocationLogGroupName:
+    Description: CloudWatch Log Group for Bedrock model invocation logging (configure manually via CLI/Console).
+    Value: !Ref BedrockInvocationLogGroup
+  BedrockLoggingServiceRoleArn:
+    Description: ARN of the Bedrock logging service role (use this when configuring model invocation logging).
+    Value: !GetAtt BedrockLoggingServiceRole.Arn
